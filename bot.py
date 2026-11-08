@@ -14,7 +14,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 123456789                 # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
