@@ -14,12 +14,14 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
-GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
+GROUP_ID = -1004385109465            # यहाँ bypass bot का जवाब आएगा और normal bot link निकालेगा
 CHANNEL_ID = -1004435774367          # यहाँ image/video जाएगा, और इसी पर नज़र रहेगी
 STICKER_ID = "CAACAgUAAxkBAAICH2qksuIcm_ZAZV8pXDtSbcWP2QuoAAK6IQAC90IBVB6iwsOwbpqjPQQ"
+
+BYPASS_BOT_USERNAME = "Nick_Bypass_Bot" # वह bot जिसे DM में link भेजना है
 
 QUIET_SECONDS = 15   # आख़िरी video के इतने सेकंड बाद तक कुछ नया न आए तो batch पूरा
 
@@ -27,7 +29,7 @@ QUIET_SECONDS = 15   # आख़िरी video के इतने सेकं
 AUTO_FETCH = True            # True: link पर क्लिक की जगह userbot खुद /start भेजकर bot का reply उठाएगा
 BOT_QUIET_SECONDS = 8        # bot का आख़िरी message आने के इतने सेकंड बाद reply पूरा माना जाएगा
 FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक कुछ न आए तो यह post छोड़ दो
-BYPASS_TIMEOUT = 30         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
+BYPASS_TIMEOUT = 30         # bypass bot के जवाब का इंतज़ार (सेकंड)
 MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
@@ -148,12 +150,22 @@ async def wait_for_videos():
 # ---------- Fubuki_xRobot से videos उठाना ----------
 collect = {"bot_id": None, "msgs": [], "last": 0.0}
 
+# Bypass bot के DM के messages ट्रैक करने के लिए
+bypass_dm_collect = {"bot_id": None, "msgs": [], "last": 0.0}
+
 
 @userbot.on_message(filters.private & filters.incoming)
-async def from_file_bot(_, m):
+async def private_message_listener(_, m):
+    # 1) अगर Fubuki bot से message आया है
     if collect["bot_id"] and m.from_user and m.from_user.id == collect["bot_id"]:
         collect["msgs"].append(m)
         collect["last"] = time.time()
+        return
+
+    # 2) अगर Bypass bot से DM में जवाब आया है
+    if bypass_dm_collect["bot_id"] and m.from_user and m.from_user.id == bypass_dm_collect["bot_id"]:
+        bypass_dm_collect["msgs"].append(m)
+        bypass_dm_collect["last"] = time.time()
 
 
 URL_RE = re.compile(
@@ -207,22 +219,9 @@ def copy_full_text_from_msg(m):
     return copied.strip()
 
 
-def message_urls(m):
-    """message के कॉपी किए गए पूरे text से सारे URLs (क्रम में)"""
-    copied_text = copy_full_text_from_msg(m)
-    urls = [clean_url(u) for u in URL_RE.findall(copied_text)]
-    seen, out = set(), []
-    for u in urls:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-
 def extract_bypassed_link_from_text(copied_text, sent_url=""):
     """
-    Normal bot द्वारा कॉपी किए गए bypass bot के पूरे text में से
-    असली bypassed link निकालो (original sent_url को छोड़कर)।
+    कॉपी किए गए text में से असली bypassed link निकालो (original sent_url को छोड़कर)।
     """
     if not copied_text:
         return None
@@ -238,20 +237,7 @@ def extract_bypassed_link_from_text(copied_text, sent_url=""):
         if deep:
             return f"https://t.me/{deep[0]}?start={deep[1]}"
 
-    # 2) अगर ?start= नहीं है, तो 'bypassed' / 'destination' / 'unlocked' लाइन के बाद वाला बाहरी link देखो
-    lines = copied_text.splitlines()
-    for idx, line in enumerate(lines):
-        if re.search(r"bypass|unlock|dest|result|final|link\s*:-?", line, re.I):
-            if re.search(r"orig|source|input", line, re.I):
-                continue
-            chunk = "\n".join(lines[idx : idx + 2])
-            for u in [clean_url(x) for x in URL_RE.findall(chunk)]:
-                if u.lower() != sent_clean and not any(
-                    d in u.lower() for d in ("t.me/", "telegram.me/", "telegram.dog/")
-                ):
-                    return u
-
-    # 3) वरना आख़िरी बाहरी link (जो original link या कोई साधारण telegram channel न हो)
+    # 2) अगर ?start= नहीं है, तो बाहरी link देखो
     ext_links = [
         u
         for u in all_urls
@@ -264,29 +250,18 @@ def extract_bypassed_link_from_text(copied_text, sent_url=""):
     return None
 
 
-def pick_next_link(urls):
-    """bot-link (?start=) या बाहरी link चुनो; t.me के channel/join links छोड़ दो"""
-    for u in urls:
-        deep = parse_deep(u)
-        if deep:
-            return f"https://t.me/{deep[0]}?start={deep[1]}"
-        if not any(d in u.lower() for d in ("t.me/", "telegram.me/", "telegram.dog/")):
-            return u
-    return None
-
-
-async def refresh(m):
-    """bot ने message edit किया हो तो ताज़ा रूप लो"""
+async def refresh_msg(chat_id, msg_id):
+    """message edit हुआ हो तो ताज़ा रूप लो"""
     try:
-        fresh = await userbot.get_messages(m.chat.id, m.id)
+        fresh = await userbot.get_messages(chat_id, msg_id)
         if fresh and not fresh.empty:
             return fresh
     except Exception:
         pass
-    return m
+    return None
 
 
-group_inbox = {}   # group में आए नए (दूसरों के) messages
+group_inbox = {}   # group में आए नए messages
 
 
 @userbot.on_message(filters.chat(GROUP_ID) & filters.incoming)
@@ -304,173 +279,84 @@ async def group_watch(_, m):
             group_inbox.pop(k, None)
 
 
-async def raw_group_messages(sent_id):
-    """Pyrogram के parse से बचकर: group के नए messages सीधे Telegram से (raw), ताज़ा रूप में"""
-    peer = await userbot.resolve_peer(GROUP_ID)
-    res = await userbot.invoke(
-        raw.functions.messages.GetHistory(
-            peer=peer, offset_id=0, offset_date=0, add_offset=0,
-            limit=30, max_id=0, min_id=sent_id, hash=0,
-        )
-    )
-    out = []
-    for m in res.messages:
-        if not hasattr(m, "message"):          # service / empty message
-            continue
-        if getattr(m, "out", False):           # हमारे अपने messages
-            continue
-        if m.id in own_group_msg_ids:
-            continue
-        from_id = getattr(getattr(m, "from_id", None), "user_id", None)
-        if bot_info["id"] and from_id == bot_info["id"]:
-            continue
-
-        text = m.message or ""
-        extra = []
-        for e in (getattr(m, "entities", None) or []):
-            u = getattr(e, "url", None)
-            if u:
-                extra.append(u)
-        mk = getattr(m, "reply_markup", None)
-        for row in (getattr(mk, "rows", None) or []):
-            for btn in row.buttons:
-                u = getattr(btn, "url", None)
-                if u:
-                    extra.append(u)
-
-        copied_text = text
-        for u in extra:
-            if u and u not in copied_text:
-                copied_text += f"\n{u}"
-
-        rt = getattr(m, "reply_to", None)
-        media = type(m.media).__name__ if getattr(m, "media", None) else "-"
-        out.append({
-            "id": m.id,
-            "reply_to": getattr(rt, "reply_to_msg_id", None),
-            "copied_text": copied_text.strip(),
-            "summary": f"#{m.id} media={media} len={len(text)} '{text[:40]}'".replace("\n", " "),
-        })
-    return out
-
-
-async def wait_bypass_and_repost(sent_id, sent_url, notify, pid):
+async def bypass_via_dm(short_link, notify, pid):
     """
-    1. Group में bypass bot के reply का इंतज़ार करो।
-    2. Normal bot की मदद से bypass bot का सारा text कॉपी करके उसमें से bypassed link निकालो।
-    3. Normal bot (`bot`) उस bypassed link को वापस GROUP_ID में भेजेगा।
-    4. वही link लौटाओ ताकि userbot उस link वाले bot के पास जा सके।
+    1. Userbot short_link को @Nick_Bypass_Bot के DM में भेजेगा।
+    2. Bypass bot के DM जवाब का इंतज़ार करेगा (edit होने पर अपडेट भी पकड़ेगा)।
+    3. जवाब का text कॉपी करके group में भेजेगा, ताकि normal bot उससे link निकाल सके।
     """
+    try:
+        bypass_bot_user = await userbot.get_users(BYPASS_BOT_USERNAME)
+    except Exception as e:
+        await notify(f"Post {pid}: Bypass bot (@{BYPASS_BOT_USERNAME}) नहीं मिला: {e}")
+        return None
+
+    bypass_dm_collect["bot_id"] = bypass_bot_user.id
+    bypass_dm_collect["msgs"] = []
+    bypass_dm_collect["last"] = 0.0
+
+    # DM में link भेजो
+    sent_dm = await userbot.send_message(bypass_bot_user.id, short_link)
+    await notify(f"Post {pid}: Link @{BYPASS_BOT_USERNAME} के DM में भेजा, जवाब का इंतज़ार...")
+
     t0 = time.time()
-    cands = {}
-    last_raw = []
-
+    last_len = 0
     while time.time() - t0 < BYPASS_TIMEOUT:
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         if running["stop"]:
-            return None, []
+            return None
 
-        found_link = None
+        # अगर DM में bot का message आया है
+        if bypass_dm_collect["msgs"]:
+            # ताज़ा messages लो (अगर bot ने edit किया हो)
+            latest_msgs = []
+            for msg in bypass_dm_collect["msgs"]:
+                refreshed = await refresh_msg(msg.chat.id, msg.id)
+                latest_msgs.append(refreshed or msg)
 
-        # --- रास्ता 1: raw (सबसे भरोसेमंद) ---
-        try:
-            last_raw = await raw_group_messages(sent_id)
-        except Exception as e:
-            print("[bypass] raw error:", repr(e))
-            last_raw = []
+            # आख़िरी message या सबसे बड़ा text वाला message लो
+            latest_msgs.sort(key=lambda x: x.id)
+            target_msg = latest_msgs[-1]
+            copied_text = copy_full_text_from_msg(target_msg)
 
-        r_replies, r_others = [], []
-        for r in last_raw:
-            link = extract_bypassed_link_from_text(r["copied_text"], sent_url)
-            if link:
-                (r_replies if r["reply_to"] == sent_id else r_others).append(link)
-        if r_replies:
-            found_link = r_replies[0]
-        elif r_others:
-            found_link = r_others[0]
+            # अगर पिछले से text बदल गया है और शांत हो गया है
+        if bypass_dm_collect["msgs"] and (time.time() - bypass_dm_collect["last"] >= 4):
+            latest_msgs = bypass_dm_collect["msgs"]
+            target_msg = latest_msgs[-1]
+            refreshed = await refresh_msg(target_msg.chat.id, target_msg.id)
+            if refreshed:
+                target_msg = refreshed
 
-        # --- रास्ता 2: Pyrogram से (live handler + history + ताज़ा fetch) ---
-        if not found_link:
-            ids = {i for i in group_inbox if i > sent_id}
-            try:
-                async for m in userbot.get_chat_history(GROUP_ID, limit=30):
-                    if m.id <= sent_id:
-                        break
-                    if m.id not in own_group_msg_ids:
-                        ids.add(m.id)
-            except Exception as e:
-                print("[bypass] history error:", repr(e))
+            copied_text = copy_full_text_from_msg(target_msg)
+            found_link = extract_bypassed_link_from_text(copied_text, short_link)
 
-            cands = {i: group_inbox[i] for i in ids if i in group_inbox}
-            if ids:
-                try:
-                    fresh = await userbot.get_messages(GROUP_ID, sorted(ids))
-                    if not isinstance(fresh, list):
-                        fresh = [fresh]
-                    for fm in fresh:
-                        if fm and not fm.empty and not fm.outgoing and fm.id not in own_group_msg_ids:
-                            if fm.from_user and bot_info["id"] and fm.from_user.id == bot_info["id"]:
-                                continue
-                            cands[fm.id] = fm
-                except Exception as e:
-                    print("[bypass] get_messages error:", repr(e))
-
-            replies, others = [], []
-            for i in sorted(cands, reverse=True):
-                m = cands[i]
-                try:
-                    copied_text = copy_full_text_from_msg(m)
-                    link = extract_bypassed_link_from_text(copied_text, sent_url)
-                except Exception as e:
-                    print("[bypass] parse error:", repr(e))
-                    continue
-                if link:
-                    (replies if m.reply_to_message_id == sent_id else others).append(link)
-
-            if replies:
-                found_link = replies[0]
-            elif others:
-                found_link = others[0]
-
-        # --- अगर bypassed link मिल गया तो Normal Bot उसे वापस group में भेजेगा ---
-        if found_link:
-            try:
-                bm = await bot.send_message(
+            if found_link or len(copied_text) > 20:
+                bypass_dm_collect["bot_id"] = None
+                
+                # अब इस मिले हुए जवाब को GROUP_ID में भेज दो, ताकि Normal Bot इसे देख सके
+                group_post = await userbot.send_message(
                     GROUP_ID,
-                    found_link,
-                    disable_web_page_preview=True,
+                    f"Bypass Response for Post {pid}:\n{copied_text}",
+                    disable_web_page_preview=True
                 )
-                own_group_msg_ids.add(bm.id)
-                await notify(f"Post {pid}: Normal bot ने bypass text से link निकालकर group में भेज दिया:\n{found_link}")
-            except Exception as e:
-                print("Normal bot से group में भेजने में error (शायद bot group में नहीं है):", e)
-                um = await userbot.send_message(
-                    GROUP_ID,
-                    found_link,
-                    disable_web_page_preview=True,
-                )
-                own_group_msg_ids.add(um.id)
-                await notify(
-                    f"Post {pid}: Bypassed link मिल गया (Normal bot group में न होने से userbot ने भेजा):\n{found_link}"
-                )
-            return found_link, []
+                own_group_msg_ids.add(group_post.id)
 
-    # --- नहीं मिला: क्या दिखा, वह बताओ ---
-    diag = [r["summary"] for r in last_raw[:4]]
-    if not diag:
-        for i in sorted(cands)[:3]:
-            m = cands[i]
-            who = (m.from_user.first_name if m.from_user else "?")
-            snippet = str(m.text or m.caption or "[media]")[:60].replace("\n", " ")
-            diag.append(f"{who}: {snippet}")
-    print(f"[bypass] timeout, raw={len(last_raw)} pyro={len(cands)}")
-    return None, diag
+                # Normal Bot से बोलो या खुद से link निकालो
+                if found_link:
+                    bm = await bot.send_message(GROUP_ID, found_link, disable_web_page_preview=True)
+                    own_group_msg_ids.add(bm.id)
+                    await notify(f"Post {pid}: Bypass link मिल गया और normal bot ने group में भेज दिया:\n{found_link}")
+                    return found_link
+                return copied_text
+
+    bypass_dm_collect["bot_id"] = None
+    await notify(f"Post {pid}: Bypass bot से DM में समय पर जवाब नहीं मिला।")
+    return None
 
 
 async def resolve_chain(start_link, notify, pid):
     """
-    link -> (bot को /start) -> reply में नया link -> (बाहरी link हो तो group का bypass bot)
-    -> Normal bot द्वारा bypassed link वापस group में भेजना -> Userbot का उस bot के पास जाना।
+    link -> Bypass DM -> Group -> Normal bot -> Bot start -> ...
     """
     current = start_link
     last_bot = None
@@ -483,8 +369,6 @@ async def resolve_chain(start_link, notify, pid):
 
         if deep:
             bot_user, payload = deep
-            # अगर बिना bypass के सीधे किसी दूसरे फ़ाइनल bot का link मिला है तो वही आख़िरी link है;
-            # लेकिन अगर अभी-अभी bypass होकर link आया है तो userbot उस bot के पास ज़रूर जाएगा!
             if last_bot and bot_user.lower() != last_bot.lower() and not just_bypassed:
                 return f"https://t.me/{bot_user}?start={payload}"
 
@@ -495,7 +379,7 @@ async def resolve_chain(start_link, notify, pid):
                 await notify(f"Post {pid}: @{bot_user} का कोई reply नहीं आया")
                 return None
             last_bot = bot_user
-            msgs = [await refresh(x) for x in msgs]
+            msgs = [await refresh_msg(x.chat.id, x.id) or x for x in msgs]
             urls = [u for x in msgs for u in message_urls(x)]
             nxt = pick_next_link(urls)
             if not nxt:
@@ -505,24 +389,55 @@ async def resolve_chain(start_link, notify, pid):
                 return "FORWARDED"
             current = nxt
         else:
-            # बाहरी (shortener) link: group के bypass bot से bypass कराओ
-            sent = await userbot.send_message(GROUP_ID, current)
-            own_group_msg_ids.add(sent.id)
-            await notify(f"Post {pid}: shortener link group में भेजा, bypass bot के reply का इंतज़ार…")
-            bypassed, diag = await wait_bypass_and_repost(sent.id, current, notify, pid)
-            if not bypassed:
-                extra = ("\nदेखे गए messages:\n" + "\n".join(diag)) if diag else "\n(group में कोई नया message नहीं दिखा)"
-                await notify(f"Post {pid}: bypass bot से link नहीं मिला{extra}")
+            # Shortener link मिला -> Bypass bot के DM में भेजो
+            bypassed_result = await bypass_via_dm(current, notify, pid)
+            if not bypassed_result:
                 return None
-            current = bypassed
+            
+            # अगर DM जवाब में सीधा t.me लिंक मिला है तो उसे लो, वरना text से निकालो
+            extracted = extract_bypassed_link_from_text(bypassed_result, current)
+            if not extracted:
+                # अगर सीधे लिंक नहीं मिला, तो text में से कोई भी t.me link ढूँढो
+                all_t_me = re.findall(r"(?:https?://)?t\.me/[^\s]+", bypassed_result)
+                if all_t_me:
+                    extracted = clean_url(all_t_me[-1])
+            
+            if not extracted:
+                await notify(f"Post {pid}: Bypass जवाब से valid link नहीं निकल पाया।")
+                return None
+                
+            current = extracted
             just_bypassed = True
 
     await notify(f"Post {pid}: बहुत ज़्यादा कड़ियाँ हो गईं, रुक गया")
     return None
 
 
+def message_urls(m):
+    """message से सारे URLs"""
+    copied_text = copy_full_text_from_msg(m)
+    urls = [clean_url(u) for u in URL_RE.findall(copied_text)]
+    seen, out = set(), []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def pick_next_link(urls):
+    """bot-link (?start=) या बाहरी link चुनो"""
+    for u in urls:
+        deep = parse_deep(u)
+        if deep:
+            return f"https://t.me/{deep[0]}?start={deep[1]}"
+        if not any(d in u.lower() for d in ("t.me/", "telegram.me/", "telegram.dog/")):
+            return u
+    return None
+
+
 async def forward_to_group(m):
-    """bot का message group में forward करो; न हो पाए तो text की copy भेजो"""
+    """bot का message group में forward करो"""
     try:
         fm = await userbot.forward_messages(GROUP_ID, m.chat.id, m.id)
         if hasattr(fm, "id"):
@@ -536,7 +451,7 @@ async def forward_to_group(m):
 
 
 async def fetch_from_bot(username, payload):
-    """deep link पर क्लिक करने जैसा: bot को /start <payload> भेजो और उसके media/messages जमा करो"""
+    """bot को /start <payload> भेजो और उसके media/messages जमा करो"""
     user = await userbot.get_users(username)
     collect["bot_id"] = user.id
     collect["msgs"] = []
@@ -590,7 +505,7 @@ async def process_range(start_id, end_id, notify):
             raw = msg.caption.html if msg.caption else (msg.text.html if msg.text else "")
             caption = clean_caption(raw)
 
-            # 1) image/video (बिना username) -> channel
+            # 1) image/video -> channel
             await send_media(msg, caption)
 
             # 2) Download/Watch link
@@ -599,7 +514,6 @@ async def process_range(start_id, end_id, notify):
                 continue
 
             if AUTO_FETCH:
-                # link-चेन चलाओ: bot -> shortener -> bypass (normal bot reposts link) -> userbot goes to bot
                 final_link = await resolve_chain(link, notify, pid)
                 if not final_link:
                     continue
@@ -609,7 +523,6 @@ async def process_range(start_id, end_id, notify):
                     await notify(f"Post {pid}: आख़िरी link group में भेजा। अब videos channel में forward करो…")
                 await wait_for_videos()
             else:
-                # पुराना तरीका: link group में भेजो, videos आप forward करोगे
                 sm = await userbot.send_message(GROUP_ID, link)
                 own_group_msg_ids.add(sm.id)
                 await notify(f"Post {pid} भेजा। अब videos channel में forward करो…")
@@ -644,7 +557,6 @@ async def bot_stop(_, message):
 async def bot_range(_, message):
     text = message.text.strip()
 
-    # links हों तो उनके आख़िरी नंबर लो, वरना सीधे दो नंबर
     links = re.findall(r"t\.me/c/\d+/(\d+)", text)
     nums = [int(x) for x in links] if len(links) >= 2 else [int(x) for x in re.findall(r"\d+", text)]
     if len(nums) < 2:
@@ -678,15 +590,12 @@ async def main():
     me_bot = await bot.get_me()
     bot_info["id"] = me_bot.id
 
-    # सारे chats/channels की जानकारी cache करो, वरना "Peer id invalid" आ सकता है
     async for _ in userbot.get_dialogs():
         pass
 
     print("Userbot + Bot चालू हैं। Bot को start id aur end id भेजो।")
-    await idle()
-    await bot.stop()
-    await userbot.stop()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    userbot.run(main())
+    asyncio.run(main())
