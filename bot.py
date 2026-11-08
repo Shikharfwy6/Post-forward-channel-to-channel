@@ -1,5 +1,6 @@
 import asyncio
 import os
+import html as htmllib
 import re
 import time
 
@@ -13,7 +14,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478        # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 123456789                 # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -26,6 +27,8 @@ QUIET_SECONDS = 15   # आख़िरी video के इतने सेकं
 AUTO_FETCH = True            # True: link पर क्लिक की जगह userbot खुद /start भेजकर bot का reply उठाएगा
 BOT_QUIET_SECONDS = 8        # bot का आख़िरी message आने के इतने सेकंड बाद reply पूरा माना जाएगा
 FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक कुछ न आए तो यह post छोड़ दो
+BYPASS_TIMEOUT = 120         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
+MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
 userbot = Client(
@@ -151,26 +154,125 @@ async def from_file_bot(_, m):
         collect["last"] = time.time()
 
 
-async def extract_final_link(msgs):
-    """bot के reply के buttons में से असली link निकालो (t.me वाले links छोड़कर)"""
-    links = []
-    for m in msgs:
-        try:
-            fresh = await userbot.get_messages(m.chat.id, m.id)   # bot ने message edit किया हो तो ताज़ा लो
-            if fresh and not fresh.empty:
-                m = fresh
-        except Exception:
-            pass
-        kb = m.reply_markup
-        if kb and hasattr(kb, "inline_keyboard"):
-            for row in kb.inline_keyboard:
-                for btn in row:
-                    if getattr(btn, "url", None):
-                        links.append(btn.url)
-    for u in links:
+URL_RE = re.compile(r"https?://[^\s\"<>']+")
+DEEP_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)\?start=([\w-]+)")
+
+
+def parse_deep(url):
+    m = DEEP_RE.match(url or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def message_urls(m):
+    """message के text, hyperlink और buttons से सारे URLs (क्रम में)"""
+    raw = ""
+    if m.text:
+        raw = m.text.html
+    elif m.caption:
+        raw = m.caption.html
+    urls = [u.rstrip(".,;)") for u in URL_RE.findall(htmllib.unescape(raw))]
+    kb = m.reply_markup
+    if kb and hasattr(kb, "inline_keyboard"):
+        for row in kb.inline_keyboard:
+            for btn in row:
+                if getattr(btn, "url", None):
+                    urls.append(btn.url)
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def pick_next_link(urls):
+    """bot-link (?start=) या बाहरी link चुनो; t.me के channel/join links छोड़ दो"""
+    for u in urls:
+        if parse_deep(u):
+            return u
         if "t.me/" not in u and "telegram.me/" not in u:
             return u
-    return links[0] if links else None
+    return None
+
+
+async def refresh(m):
+    """bot ने message edit किया हो तो ताज़ा रूप लो"""
+    try:
+        fresh = await userbot.get_messages(m.chat.id, m.id)
+        if fresh and not fresh.empty:
+            return fresh
+    except Exception:
+        pass
+    return m
+
+
+async def wait_bypass_link(sent_id):
+    """group में हमारे भेजे link के बाद आए bypass bot के reply से t.me ?start= link निकालो"""
+    t0 = time.time()
+    while time.time() - t0 < BYPASS_TIMEOUT:
+        await asyncio.sleep(3)
+        if running["stop"]:
+            return None
+        replies, others = [], []
+        async for m in userbot.get_chat_history(GROUP_ID, limit=15):
+            if m.id <= sent_id:
+                break
+            if m.outgoing:
+                continue
+            link = next((u for u in message_urls(m) if parse_deep(u)), None)
+            if link:
+                (replies if m.reply_to_message_id == sent_id else others).append(link)
+        if replies:
+            return replies[0]
+        if others:
+            return others[0]
+    return None
+
+
+async def resolve_chain(start_link, notify, pid):
+    """
+    link -> (bot को /start) -> reply में नया link -> (बाहरी link हो तो group का bypass bot)
+    -> फिर bot... जब तक दूसरे bot का link न मिले। वही आख़िरी link है।
+    """
+    current = start_link
+    last_bot = None
+
+    for hop in range(MAX_HOPS):
+        if running["stop"]:
+            return None
+        deep = parse_deep(current)
+
+        if deep:
+            bot_user, payload = deep
+            if last_bot and bot_user.lower() != last_bot.lower():
+                return current                      # दूसरे bot का link = आख़िरी link
+            await notify(f"Post {pid}: @{bot_user} को /start भेज रहा हूँ…")
+            msgs = await fetch_from_bot(bot_user, payload)
+            if not msgs:
+                await notify(f"Post {pid}: @{bot_user} का कोई reply नहीं आया")
+                return None
+            last_bot = bot_user
+            msgs = [await refresh(x) for x in msgs]
+            urls = [u for x in msgs for u in message_urls(x)]
+            nxt = pick_next_link(urls)
+            if not nxt:
+                for x in msgs:
+                    await forward_to_group(x)
+                await notify(f"Post {pid}: reply में link नहीं मिला, message group में forward किया")
+                return None
+            current = nxt
+        else:
+            # बाहरी (shortener) link: group के bypass bot से bypass कराओ
+            sent = await userbot.send_message(GROUP_ID, current)
+            await notify(f"Post {pid}: link group में भेजा, bypass का इंतज़ार…")
+            bypassed = await wait_bypass_link(sent.id)
+            if not bypassed:
+                await notify(f"Post {pid}: bypass bot से link नहीं मिला")
+                return None
+            current = bypassed
+
+    await notify(f"Post {pid}: बहुत ज़्यादा कड़ियाँ हो गईं, रुक गया")
+    return None
 
 
 async def forward_to_group(m):
@@ -249,23 +351,13 @@ async def process_range(start_id, end_id, notify):
 
             deep = re.search(r"t\.me/([A-Za-z0-9_]+)\?start=([\w-]+)", link)
 
-            if AUTO_FETCH and deep:
-                # link पर क्लिक की जगह: bot को /start भेजो, reply के videos उठाओ
-                await notify(f"Post {pid}: @{deep.group(1)} को /start भेज रहा हूँ…")
-                vids = await fetch_from_bot(deep.group(1), deep.group(2))
-                if not vids:
-                    await notify(f"Post {pid}: bot का कोई reply नहीं आया, छोड़ रहा हूँ")
+            if AUTO_FETCH:
+                # link-चेन चलाओ: bot -> link -> bypass -> bot -> ... -> आख़िरी link
+                final_link = await resolve_chain(link, notify, pid)
+                if not final_link:
                     continue
-
-                final_link = await extract_final_link(vids)
-                if final_link:
-                    await userbot.send_message(GROUP_ID, final_link)
-                    await notify(f"Post {pid}: link group में भेजा। अब videos channel में forward करो…")
-                else:
-                    # button में link न मिला तो पूरा message ही forward कर दो
-                    for vm in vids:
-                        await forward_to_group(vm)
-                    await notify(f"Post {pid}: button link नहीं मिला, bot का message forward किया।")
+                await userbot.send_message(GROUP_ID, final_link)
+                await notify(f"Post {pid}: आख़िरी link group में भेजा। अब videos channel में forward करो…")
                 await wait_for_videos()
             else:
                 # पुराना तरीका: link group में भेजो, videos आप forward करोगे
