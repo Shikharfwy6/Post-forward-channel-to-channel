@@ -13,7 +13,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478        # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -151,6 +151,28 @@ async def from_file_bot(_, m):
         collect["last"] = time.time()
 
 
+async def extract_final_link(msgs):
+    """bot के reply के buttons में से असली link निकालो (t.me वाले links छोड़कर)"""
+    links = []
+    for m in msgs:
+        try:
+            fresh = await userbot.get_messages(m.chat.id, m.id)   # bot ने message edit किया हो तो ताज़ा लो
+            if fresh and not fresh.empty:
+                m = fresh
+        except Exception:
+            pass
+        kb = m.reply_markup
+        if kb and hasattr(kb, "inline_keyboard"):
+            for row in kb.inline_keyboard:
+                for btn in row:
+                    if getattr(btn, "url", None):
+                        links.append(btn.url)
+    for u in links:
+        if "t.me/" not in u and "telegram.me/" not in u:
+            return u
+    return links[0] if links else None
+
+
 async def forward_to_group(m):
     """bot का message group में forward करो; न हो पाए तो text की copy भेजो"""
     try:
@@ -235,9 +257,15 @@ async def process_range(start_id, end_id, notify):
                     await notify(f"Post {pid}: bot का कोई reply नहीं आया, छोड़ रहा हूँ")
                     continue
 
-                for vm in vids:
-                    await forward_to_group(vm)
-                await notify(f"Post {pid}: bot का reply group में भेजा। अब videos channel में forward करो…")
+                final_link = await extract_final_link(vids)
+                if final_link:
+                    await userbot.send_message(GROUP_ID, final_link)
+                    await notify(f"Post {pid}: link group में भेजा। अब videos channel में forward करो…")
+                else:
+                    # button में link न मिला तो पूरा message ही forward कर दो
+                    for vm in vids:
+                        await forward_to_group(vm)
+                    await notify(f"Post {pid}: button link नहीं मिला, bot का message forward किया।")
                 await wait_for_videos()
             else:
                 # पुराना तरीका: link group में भेजो, videos आप forward करोगे
