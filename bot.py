@@ -8,6 +8,7 @@ import re
 import time
 
 from pyrogram import Client, filters, idle, enums, raw
+from pyrogram.errors import FloodWait
 
 # ================= SETTINGS =================
 # सिर्फ़ ये चार ENV से आते हैं
@@ -33,6 +34,8 @@ FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक �
 BYPASS_TIMEOUT = 90         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
 BYPASS_BOT = "Nick_Bypass_Bot"   # bypass bot का username (बिना @)
 BYPASS_VIA_DM = True         # True: पहले bot को सीधे DM में link भेजो, न चले तो group में
+SEND_FINAL_LINK_TO_GROUP = False   # True: आख़िरी link group में भी भेजो (record के लिए)
+MEDIA_QUIET_SECONDS = 30     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
 MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
@@ -98,6 +101,14 @@ async def send_media(msg, caption, dest=None):
             return await userbot.send_video(dest, source, caption=caption)
         if msg.animation:
             return await userbot.send_animation(dest, source, caption=caption)
+        if msg.audio:
+            return await userbot.send_audio(dest, source, caption=caption)
+        if msg.voice:
+            return await userbot.send_voice(dest, source, caption=caption)
+        if msg.video_note:
+            return await userbot.send_video_note(dest, source)
+        if msg.sticker:
+            return await userbot.send_sticker(dest, source)
         if msg.document:
             return await userbot.send_document(dest, source, caption=caption)
         return await userbot.send_message(dest, caption or ".")
@@ -107,7 +118,8 @@ async def send_media(msg, caption, dest=None):
         own_sent_ids.add(m.id)
         return
 
-    media_obj = msg.photo or msg.video or msg.animation or msg.document
+    media_obj = (msg.photo or msg.video or msg.animation or msg.audio or msg.voice
+                 or msg.video_note or msg.sticker or msg.document)
     try:
         m = await _send(media_obj.file_id)
     except Exception as e:
@@ -433,6 +445,81 @@ async def wait_bypass_link(sent_id, chat_id=None):
     return None, diag
 
 
+# ---------- आख़िरी bot से files लेकर channel में (sender और caption छिपाकर) ----------
+MEDIA_ATTRS = ("video", "photo", "document", "animation", "audio", "voice", "video_note", "sticker")
+
+
+def is_media_msg(m):
+    return any(getattr(m, a, None) for a in MEDIA_ATTRS)
+
+
+async def send_hidden(from_chat, msgs, dest):
+    """forward करो, sender का नाम और caption छिपाकर. न हो पाए तो copy/upload से भेजो"""
+    ids = [m.id for m in msgs]
+    try:
+        from_peer = await userbot.resolve_peer(from_chat)
+        to_peer = await userbot.resolve_peer(dest)
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            for attempt in range(3):
+                try:
+                    await userbot.invoke(
+                        raw.functions.messages.ForwardMessages(
+                            from_peer=from_peer,
+                            id=chunk,
+                            to_peer=to_peer,
+                            random_id=[userbot.rnd_id() for _ in chunk],
+                            drop_author=True,
+                            drop_media_captions=True,
+                        )
+                    )
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+            else:
+                raise RuntimeError("FloodWait बार-बार")
+        return
+    except Exception as e:
+        print("[hidden forward] fail, copy से भेज रहा हूँ:", type(e).__name__, str(e)[:80])
+
+    for m in msgs:
+        try:
+            await send_media(m, "", dest=dest)
+        except Exception as e:
+            print("[hidden copy] fail:", type(e).__name__, str(e)[:80])
+
+
+async def pull_and_forward(username, payload):
+    """bot को /start भेजो; जो भी files (कितनी भी) आएँ उन्हें आते ही channel में भेजते जाओ"""
+    user = await userbot.get_users(username)
+    collect["bot_id"] = user.id
+    collect["msgs"] = []
+    collect["last"] = 0.0
+
+    await userbot.send_message(username, f"/start {payload}")
+
+    done, total = set(), 0
+    t0 = time.time()
+    while True:
+        await asyncio.sleep(2)
+        if running["stop"]:
+            break
+        new = [m for m in sorted(collect["msgs"], key=lambda x: x.id)
+               if m.id not in done and is_media_msg(m)]
+        if new:
+            await send_hidden(user.id, new, CHANNEL_ID)
+            done.update(m.id for m in new)
+            total += len(new)
+        if collect["msgs"]:
+            if time.time() - collect["last"] >= MEDIA_QUIET_SECONDS:
+                break
+        elif time.time() - t0 > FIRST_TIMEOUT:
+            break
+
+    collect["bot_id"] = None
+    return total
+
+
 async def resolve_chain(start_link, notify, pid):
     """
     link -> (bot को /start) -> reply में नया link -> (बाहरी link हो तो group का bypass bot)
@@ -572,9 +659,23 @@ async def process_range(start_id, end_id, notify):
                 final_link = await resolve_chain(link, notify, pid)
                 if not final_link:
                     continue
-                await userbot.send_message(GROUP_ID, final_link)
-                await notify(f"Post {pid}: आख़िरी link group में भेजा। अब videos channel में forward करो…")
-                await wait_for_videos()
+                if SEND_FINAL_LINK_TO_GROUP:
+                    await userbot.send_message(GROUP_ID, final_link)
+
+                final_deep = parse_deep(final_link)
+                if final_deep:
+                    # आख़िरी bot के पास जाओ, सारी files channel में (बिना sender/caption)
+                    await notify(f"Post {pid}: @{final_deep[0]} से files मँगा रहा हूँ…")
+                    total = await pull_and_forward(final_deep[0], final_deep[1])
+                    if total == 0:
+                        await notify(f"Post {pid}: bot से कोई file नहीं आई, अगले post पर जा रहा हूँ")
+                        continue
+                    await notify(f"Post {pid}: {total} files channel में भेजीं ✅")
+                else:
+                    # bot-link नहीं मिला: पुराना तरीका (आप हाथ से forward करो)
+                    await userbot.send_message(GROUP_ID, final_link)
+                    await notify(f"Post {pid}: link group में भेजा। अब videos channel में forward करो…")
+                    await wait_for_videos()
             else:
                 # पुराना तरीका: link group में भेजो, videos आप forward करोगे
                 await userbot.send_message(GROUP_ID, link)
