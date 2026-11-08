@@ -4,7 +4,7 @@ import html as htmllib
 import re
 import time
 
-from pyrogram import Client, filters, idle, enums
+from pyrogram import Client, filters, idle, enums, raw
 
 # ================= SETTINGS =================
 # सिर्फ़ ये चार ENV से आते हैं
@@ -14,7 +14,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -221,6 +221,44 @@ async def group_watch(_, m):
             group_inbox.pop(k, None)
 
 
+async def raw_group_messages(sent_id):
+    """Pyrogram के parse से बचकर: group के नए messages सीधे Telegram से (raw), ताज़ा रूप में"""
+    peer = await userbot.resolve_peer(GROUP_ID)
+    res = await userbot.invoke(
+        raw.functions.messages.GetHistory(
+            peer=peer, offset_id=0, offset_date=0, add_offset=0,
+            limit=30, max_id=0, min_id=sent_id, hash=0,
+        )
+    )
+    out = []
+    for m in res.messages:
+        if not hasattr(m, "message"):          # service / empty message
+            continue
+        if getattr(m, "out", False):           # हमारे अपने messages
+            continue
+        text = m.message or ""
+        urls = [u.rstrip(".,;)") for u in URL_RE.findall(text)]
+        for e in (getattr(m, "entities", None) or []):
+            u = getattr(e, "url", None)
+            if u:
+                urls.append(u)
+        mk = getattr(m, "reply_markup", None)
+        for row in (getattr(mk, "rows", None) or []):
+            for btn in row.buttons:
+                u = getattr(btn, "url", None)
+                if u:
+                    urls.append(u)
+        rt = getattr(m, "reply_to", None)
+        media = type(m.media).__name__ if getattr(m, "media", None) else "-"
+        out.append({
+            "id": m.id,
+            "reply_to": getattr(rt, "reply_to_msg_id", None),
+            "urls": urls,
+            "summary": f"#{m.id} media={media} len={len(text)} '{text[:40]}'".replace("\n", " "),
+        })
+    return out
+
+
 async def wait_bypass_link(sent_id):
     """
     group में हमारे भेजे link के बाद आए bypass bot के reply से t.me ?start= link निकालो।
@@ -228,12 +266,29 @@ async def wait_bypass_link(sent_id):
     """
     t0 = time.time()
     cands = {}
+    last_raw = []
     while time.time() - t0 < BYPASS_TIMEOUT:
         await asyncio.sleep(3)
         if running["stop"]:
             return None, []
 
-        # 1) candidate message ids: live handler + history (दोनों से)
+        # --- रास्ता 1: raw (सबसे भरोसेमंद) ---
+        try:
+            last_raw = await raw_group_messages(sent_id)
+        except Exception as e:
+            print("[bypass] raw error:", repr(e))
+            last_raw = []
+        r_replies, r_others = [], []
+        for r in last_raw:
+            link = next((u for u in r["urls"] if parse_deep(u)), None)
+            if link:
+                (r_replies if r["reply_to"] == sent_id else r_others).append(link)
+        if r_replies:
+            return r_replies[0], []
+        if r_others:
+            return r_others[0], []
+
+        # --- रास्ता 2: Pyrogram से (live handler + history + ताज़ा fetch) ---
         ids = {i for i in group_inbox if i > sent_id}
         try:
             async for m in userbot.get_chat_history(GROUP_ID, limit=30):
@@ -243,8 +298,6 @@ async def wait_bypass_link(sent_id):
         except Exception as e:
             print("[bypass] history error:", repr(e))
 
-        # 2) हर message को server से ताज़ा लो: bot "Processing..." को बाद में
-        #    edit करके असली नतीजा बना देता है, पुरानी copy में वह नहीं होता
         cands = {i: group_inbox[i] for i in ids if i in group_inbox}
         if ids:
             try:
@@ -272,13 +325,15 @@ async def wait_bypass_link(sent_id):
         if others:
             return others[0], []
 
-    diag = []
-    for i in sorted(cands)[:3]:
-        m = cands[i]
-        who = (m.from_user.first_name if m.from_user else "?")
-        snippet = str(m.text or m.caption or "[media]")[:60].replace("\n", " ")
-        diag.append(f"{who}: {snippet}")
-    print(f"[bypass] timeout, नए messages देखे: {len(cands)}")
+    # --- नहीं मिला: क्या दिखा, वह बताओ ---
+    diag = [r["summary"] for r in last_raw[:4]]
+    if not diag:
+        for i in sorted(cands)[:3]:
+            m = cands[i]
+            who = (m.from_user.first_name if m.from_user else "?")
+            snippet = str(m.text or m.caption or "[media]")[:60].replace("\n", " ")
+            diag.append(f"{who}: {snippet}")
+    print(f"[bypass] timeout, raw={len(last_raw)} pyro={len(cands)}")
     return None, diag
 
 
