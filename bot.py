@@ -14,7 +14,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478              # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -27,7 +27,7 @@ QUIET_SECONDS = 15   # आख़िरी video के इतने सेकं
 AUTO_FETCH = True            # True: link पर क्लिक की जगह userbot खुद /start भेजकर bot का reply उठाएगा
 BOT_QUIET_SECONDS = 8        # bot का आख़िरी message आने के इतने सेकंड बाद reply पूरा माना जाएगा
 FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक कुछ न आए तो यह post छोड़ दो
-BYPASS_TIMEOUT = 120         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
+BYPASS_TIMEOUT = 150         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
 MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
@@ -233,18 +233,29 @@ async def wait_bypass_link(sent_id):
         if running["stop"]:
             return None, []
 
-        # 1) live handler से आए messages
-        cands = {i: m for i, m in group_inbox.items() if i > sent_id}
-
-        # 2) history से भी देखो (दोनों मिलाकर)
+        # 1) candidate message ids: live handler + history (दोनों से)
+        ids = {i for i in group_inbox if i > sent_id}
         try:
-            async for m in userbot.get_chat_history(GROUP_ID, limit=15):
+            async for m in userbot.get_chat_history(GROUP_ID, limit=30):
                 if m.id <= sent_id:
                     break
-                if not m.outgoing:
-                    cands.setdefault(m.id, m)
+                ids.add(m.id)
         except Exception as e:
             print("[bypass] history error:", repr(e))
+
+        # 2) हर message को server से ताज़ा लो: bot "Processing..." को बाद में
+        #    edit करके असली नतीजा बना देता है, पुरानी copy में वह नहीं होता
+        cands = {i: group_inbox[i] for i in ids if i in group_inbox}
+        if ids:
+            try:
+                fresh = await userbot.get_messages(GROUP_ID, sorted(ids))
+                if not isinstance(fresh, list):
+                    fresh = [fresh]
+                for fm in fresh:
+                    if fm and not fm.empty and not fm.outgoing:
+                        cands[fm.id] = fm
+            except Exception as e:
+                print("[bypass] get_messages error:", repr(e))
 
         replies, others = [], []
         for i in sorted(cands, reverse=True):
