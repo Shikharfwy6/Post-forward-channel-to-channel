@@ -13,14 +13,19 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478               # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
 CHANNEL_ID = -1004435774367          # यहाँ image/video जाएगा, और इसी पर नज़र रहेगी
 STICKER_ID = "CAACAgUAAxkBAAICH2qksuIcm_ZAZV8pXDtSbcWP2QuoAAK6IQAC90IBVB6iwsOwbpqjPQQ"
 
-QUIET_SECONDS = 3   # आख़िरी video के इतने सेकंड बाद तक कुछ नया न आए तो batch पूरा
+QUIET_SECONDS = 15   # आख़िरी video के इतने सेकंड बाद तक कुछ नया न आए तो batch पूरा
+
+# --- Fubuki_xRobot वाला auto मोड ---
+AUTO_FETCH = True            # True: link पर क्लिक की जगह userbot खुद /start भेजकर bot का reply उठाएगा
+BOT_QUIET_SECONDS = 8        # bot का आख़िरी message आने के इतने सेकंड बाद reply पूरा माना जाएगा
+FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक कुछ न आए तो यह post छोड़ दो
 # ============================================
 
 userbot = Client(
@@ -74,22 +79,23 @@ def get_first_button_link(msg):
     return None
 
 
-async def send_media(msg, caption):
-    """media को CHANNEL_ID में भेजो (पहले file_id से, न चले तो download करके)"""
+async def send_media(msg, caption, dest=None):
+    """media को dest (default CHANNEL_ID) में भेजो (पहले file_id से, न चले तो download करके)"""
+    dest = dest or CHANNEL_ID
 
     async def _send(source):
         if msg.photo:
-            return await userbot.send_photo(CHANNEL_ID, source, caption=caption)
+            return await userbot.send_photo(dest, source, caption=caption)
         if msg.video:
-            return await userbot.send_video(CHANNEL_ID, source, caption=caption)
+            return await userbot.send_video(dest, source, caption=caption)
         if msg.animation:
-            return await userbot.send_animation(CHANNEL_ID, source, caption=caption)
+            return await userbot.send_animation(dest, source, caption=caption)
         if msg.document:
-            return await userbot.send_document(CHANNEL_ID, source, caption=caption)
-        return await userbot.send_message(CHANNEL_ID, caption or ".")
+            return await userbot.send_document(dest, source, caption=caption)
+        return await userbot.send_message(dest, caption or ".")
 
     if not msg.media:
-        m = await userbot.send_message(CHANNEL_ID, caption or ".")
+        m = await userbot.send_message(dest, caption or ".")
         own_sent_ids.add(m.id)
         return
 
@@ -134,6 +140,53 @@ async def wait_for_videos():
             return
 
 
+# ---------- Fubuki_xRobot से videos उठाना ----------
+collect = {"bot_id": None, "msgs": [], "last": 0.0}
+
+
+@userbot.on_message(filters.private & filters.incoming)
+async def from_file_bot(_, m):
+    if collect["bot_id"] and m.from_user and m.from_user.id == collect["bot_id"]:
+        collect["msgs"].append(m)
+        collect["last"] = time.time()
+
+
+async def forward_to_group(m):
+    """bot का message group में forward करो; न हो पाए तो text की copy भेजो"""
+    try:
+        await userbot.forward_messages(GROUP_ID, m.chat.id, m.id)
+    except Exception as e:
+        print("forward fail, text भेज रहा हूँ:", e)
+        txt = m.text.html if m.text else (m.caption.html if m.caption else "")
+        if txt:
+            await userbot.send_message(GROUP_ID, txt, disable_web_page_preview=True)
+
+
+async def fetch_from_bot(username, payload):
+    """deep link पर क्लिक करने जैसा: bot को /start <payload> भेजो और उसके media जमा करो"""
+    user = await userbot.get_users(username)
+    collect["bot_id"] = user.id
+    collect["msgs"] = []
+    collect["last"] = 0.0
+
+    await userbot.send_message(username, f"/start {payload}")
+
+    t0 = time.time()
+    while True:
+        await asyncio.sleep(2)
+        if running["stop"]:
+            break
+        if collect["msgs"]:
+            if time.time() - collect["last"] >= BOT_QUIET_SECONDS:
+                break
+        elif time.time() - t0 > FIRST_TIMEOUT:
+            break
+
+    msgs = sorted(collect["msgs"], key=lambda x: x.id)
+    collect["bot_id"] = None
+    return msgs
+
+
 # ---------- channel पर नज़र ----------
 @userbot.on_message(filters.chat(CHANNEL_ID))
 async def watch_channel(_, m):
@@ -167,17 +220,30 @@ async def process_range(start_id, end_id, notify):
             # 1) image/video (बिना username) -> channel
             await send_media(msg, caption)
 
-            # 2) Download/Watch link -> group
-            if link:
-                await userbot.send_message(GROUP_ID, link)
-            else:
+            # 2) Download/Watch link
+            if not link:
                 await notify(f"Post {pid} में button link नहीं मिला")
                 continue
 
-            await notify(f"Post {pid} भेजा। अब videos channel में forward करो…")
+            deep = re.search(r"t\.me/([A-Za-z0-9_]+)\?start=([\w-]+)", link)
 
-            # 3) videos आने तक रुको
-            await wait_for_videos()
+            if AUTO_FETCH and deep:
+                # link पर क्लिक की जगह: bot को /start भेजो, reply के videos उठाओ
+                await notify(f"Post {pid}: @{deep.group(1)} को /start भेज रहा हूँ…")
+                vids = await fetch_from_bot(deep.group(1), deep.group(2))
+                if not vids:
+                    await notify(f"Post {pid}: bot का कोई reply नहीं आया, छोड़ रहा हूँ")
+                    continue
+
+                for vm in vids:
+                    await forward_to_group(vm)
+                await notify(f"Post {pid}: bot का reply group में भेजा। अब videos channel में forward करो…")
+                await wait_for_videos()
+            else:
+                # पुराना तरीका: link group में भेजो, videos आप forward करोगे
+                await userbot.send_message(GROUP_ID, link)
+                await notify(f"Post {pid} भेजा। अब videos channel में forward करो…")
+                await wait_for_videos()
 
             # 4) sticker भेजो, फिर अगला post
             await send_sticker()
