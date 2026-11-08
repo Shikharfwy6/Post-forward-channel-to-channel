@@ -18,7 +18,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -34,7 +34,7 @@ FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक �
 BYPASS_TIMEOUT = 90         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
 BYPASS_BOT = "Nick_Bypass_Bot"   # bypass bot का username (बिना @)
 BYPASS_VIA_DM = True         # True: पहले bot को सीधे DM में link भेजो, न चले तो group में
-MEDIA_QUIET_SECONDS = 5     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
+MEDIA_QUIET_SECONDS = 7     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
 MAX_HOPS = 8                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
@@ -61,8 +61,19 @@ state = {"got_video": False, "last_video": 0.0}
 progress = {"current": None, "last_done": None, "end": None}
 
 
-class CaptchaRequired(Exception):
+class SafeStop(Exception):
+    """ऐसी हालत जहाँ आगे बढ़ना बेकार है: सुरक्षित रूप से रुको, जानकारी दो, process बंद करो"""
+    reason = "कुछ अटक गया है।"
+
+
+class CaptchaRequired(SafeStop):
     """bypass bot ने captcha/verification माँगा, जो bot हल नहीं कर सकता"""
+    reason = "Nick Bypass Bot ने captcha (verification) माँगा है, जो मैं हल नहीं कर सकता।"
+
+
+class BypassStuck(SafeStop):
+    """bypass bot से link नहीं मिला (न DM में, न group में)"""
+    reason = "Bypass bot से link नहीं मिल रहा (न DM में, न group में). शायद वह बंद है, बहुत धीमा है या कुछ और माँग रहा है।"
 
 
 # ---------- helpers ----------
@@ -286,6 +297,15 @@ def find_deep_in_json(obj):
     return None
 
 
+async def _cleanup_fwd(uname, fwd):
+    """control bot की chat से हमारा forward किया message हटाओ (chat साफ़ रहे)"""
+    try:
+        ids = [m.id for m in (fwd if isinstance(fwd, list) else [fwd])]
+        await userbot.delete_messages(uname, ids)
+    except Exception:
+        pass
+
+
 async def link_via_botapi(chat, mid, errors):
     """message को control bot को forward करो, Bot API से पढ़कर link निकालो"""
     uname = botinfo["username"]
@@ -294,7 +314,7 @@ async def link_via_botapi(chat, mid, errors):
         return None
     t0 = time.time()
     try:
-        await userbot.forward_messages(uname, chat, mid)
+        fwd = await userbot.forward_messages(uname, chat, mid)
     except Exception as e:
         errors.append("forward: " + repr(e)[:100])
         return None
@@ -308,6 +328,7 @@ async def link_via_botapi(chat, mid, errors):
                 continue
             link = find_deep_in_json(u)
             if link:
+                await _cleanup_fwd(uname, fwd)
                 return link
             msg = u.get("message", {})
             info = "BotAPI keys=" + ",".join(list(msg.keys())[:10])
@@ -315,6 +336,7 @@ async def link_via_botapi(chat, mid, errors):
             if txt:
                 info += f" text='{txt[:40]}'"
     errors.append(info or "Bot API से कोई update नहीं आया")
+    await _cleanup_fwd(uname, fwd)
     return None
 
 
@@ -473,6 +495,22 @@ def is_media_msg(m):
     return any(getattr(m, a, None) for a in MEDIA_ATTRS)
 
 
+def is_link_carrier(m):
+    """
+    image/media वाला message जो असल में सिर्फ़ link ले जा रहा है
+    (जैसे "Image" वाली तस्वीर + "Here is your link ..."). उसे file मत समझो, link के पीछे जाओ.
+    """
+    try:
+        urls = message_urls(m)
+    except Exception:
+        return False
+    if any(parse_deep(u) for u in urls):          # caption/बटन में bot-link (?start=)
+        return True
+    if getattr(m, "photo", None) and pick_next_link(urls):   # तस्वीर + बाहरी link/बटन
+        return True
+    return False
+
+
 async def send_hidden(from_chat, msgs, dest):
     """forward करो, sender का नाम और caption छिपाकर. न हो पाए तो copy/upload से भेजो"""
     ids = [m.id for m in msgs]
@@ -555,7 +593,7 @@ async def visit_bot(username, payload):
             break
         msgs = list(collect["msgs"])
         new = [m for m in sorted(msgs, key=lambda x: x.id)
-               if m.id not in done and is_media_msg(m)]
+               if m.id not in done and is_media_msg(m) and not is_link_carrier(m)]
         if new:
             await send_hidden(user.id, new, CHANNEL_ID)
             done.update(m.id for m in new)
@@ -642,7 +680,9 @@ async def run_chain(start_link, notify, pid):
                 extra = ("\nदेखा गया:\n" + "\n".join(diag)) if diag else "\n(कुछ नया नहीं दिखा)"
                 await notify(f"Post {pid}: {route} रास्ते से link नहीं मिला{extra}")
             if not bypassed:
-                return 0
+                if running["stop"]:
+                    return 0
+                raise BypassStuck()
             current = bypassed
 
     await notify(f"Post {pid}: बहुत ज़्यादा कड़ियाँ हो गईं, रुक गया")
@@ -692,7 +732,7 @@ async def process_range(start_id, end_id, notify):
             # 4) sticker भेजो, फिर अगला post
             await send_sticker()
             progress["last_done"] = pid
-        except CaptchaRequired:
+        except SafeStop:
             raise
         except Exception as e:
             print(f"Post {pid} में error:", e)
@@ -727,14 +767,19 @@ async def bot_stop(_, message):
 
 
 @bot.on_message(
-    filters.private & filters.user(OWNER_ID) & filters.text & ~filters.command(["start", "stop"])
+    filters.private & filters.user(OWNER_ID) & filters.text
+    & ~filters.command(["start", "stop"]) & ~filters.forwarded
 )
 async def bot_range(_, message):
     text = message.text.strip()
 
     # links हों तो उनके आख़िरी नंबर लो, वरना सीधे दो नंबर
     links = re.findall(r"t\.me/c/\d+/(\d+)", text)
-    nums = [int(x) for x in links] if len(links) >= 2 else [int(x) for x in re.findall(r"\d+", text)]
+    if len(links) >= 2:
+        nums = [int(x) for x in links[:2]]
+    else:
+        mm = re.fullmatch(r"\s*(\d+)\s*[,\- ]\s*(\d+)\s*", text)
+        nums = [int(mm.group(1)), int(mm.group(2))] if mm else []
     if len(nums) < 2:
         await message.reply_text("दो नंबर भेजो: start id और end id. Example: 9 16")
         return
@@ -752,13 +797,13 @@ async def bot_range(_, message):
     async def job():
         try:
             await process_range(start_id, end_id, notify)
-        except CaptchaRequired:
+        except SafeStop as e:
             cur, last, end = progress["current"], progress["last_done"], progress["end"]
             await notify(
-                "⚠️ Nick Bypass Bot ने captcha (verification) माँगा है, जो मैं हल नहीं कर सकता। इसलिए रुक रहा हूँ।\n\n"
-                f"• captcha इस post पर आया: {cur}\n"
+                f"⚠️ {e.reason}\nइसलिए सुरक्षित रूप से रुक रहा हूँ।\n\n"
+                f"• रुकना इस post पर हुआ: {cur}\n"
                 f"• आख़िरी पूरा हुआ post: {last if last else 'कोई नहीं'}\n\n"
-                f"पहले Nick Bypass Bot में captcha हल कर लीजिए, फिर bot चालू करके यह भेजिए:\n{cur} {end}\n\n"
+                f"समस्या ठीक करके bot चालू करें और यह भेजें:\n{cur} {end}\n\n"
                 f"(post {cur} की image channel में पहले ही जा चुकी हो सकती है, तो वह दोबारा आ सकती है)"
             )
             asyncio.create_task(_exit_soon())
