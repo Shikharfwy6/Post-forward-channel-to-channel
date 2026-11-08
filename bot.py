@@ -1,6 +1,9 @@
 import asyncio
 import os
 import html as htmllib
+import json
+import urllib.parse
+import urllib.request
 import re
 import time
 
@@ -223,6 +226,81 @@ async def group_watch(_, m):
             group_inbox.pop(k, None)
 
 
+# ---------- Bot API से पढ़ना (जब userbot को message "unsupported" दिखे) ----------
+# Nick Bypass Bot का reply नए तरह का message है जिसे पुराना Pyrogram पढ़ नहीं पाता
+# (MessageMediaUnsupported). Bot API नया है, वह पूरा पढ़ लेता है। इसलिए हम उस message
+# को अपने control bot को forward करते हैं और Bot API (getUpdates) से उसका पूरा रूप पढ़ते हैं।
+botinfo = {"username": None}
+botapi_updates = []   # [(समय, update dict)]
+ANY_DEEP_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)\?start=([\w-]+)")
+
+
+def _botapi_call(method, params, timeout=35):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(params).encode())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+async def botapi_poller():
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
+            if offset:
+                params["offset"] = offset
+            res = await asyncio.to_thread(_botapi_call, "getUpdates", params)
+            for u in res.get("result", []):
+                offset = u["update_id"] + 1
+                botapi_updates.append((time.time(), u))
+            del botapi_updates[:-50]
+        except Exception as e:
+            print("[botapi] poll error:", type(e).__name__)
+            await asyncio.sleep(5)
+
+
+def find_deep_in_json(obj):
+    """पूरे JSON में (text, entities, buttons, कहीं भी) पहला t.me ?start= link"""
+    blob = json.dumps(obj, ensure_ascii=False)
+    for m in ANY_DEEP_RE.finditer(blob):
+        if botinfo["username"] and m.group(1).lower() == botinfo["username"].lower():
+            continue
+        return m.group(0)
+    return None
+
+
+async def link_via_botapi(chat, mid, errors):
+    """message को control bot को forward करो, Bot API से पढ़कर link निकालो"""
+    uname = botinfo["username"]
+    if not uname:
+        errors.append("control bot का username नहीं मिला")
+        return None
+    t0 = time.time()
+    try:
+        await userbot.forward_messages(uname, chat, mid)
+    except Exception as e:
+        errors.append("forward: " + repr(e)[:100])
+        return None
+
+    info = None
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        for ts, u in list(botapi_updates):
+            if ts < t0:
+                continue
+            link = find_deep_in_json(u)
+            if link:
+                return link
+            msg = u.get("message", {})
+            info = "BotAPI keys=" + ",".join(list(msg.keys())[:10])
+            txt = msg.get("text") or msg.get("caption") or ""
+            if txt:
+                info += f" text='{txt[:40]}'"
+    errors.append(info or "Bot API से कोई update नहीं आया")
+    return None
+
+
 async def raw_group_messages(sent_id, chat_id=None):
     """Pyrogram के parse से बचकर: group के नए messages सीधे Telegram से (raw), ताज़ा रूप में"""
     peer = await userbot.resolve_peer(chat_id or GROUP_ID)
@@ -256,6 +334,7 @@ async def raw_group_messages(sent_id, chat_id=None):
             "id": m.id,
             "reply_to": getattr(rt, "reply_to_msg_id", None),
             "urls": urls,
+            "unsupported": media == "MessageMediaUnsupported",
             "summary": f"#{m.id} media={media} len={len(text)} '{text[:40]}'".replace("\n", " "),
         })
     return out
@@ -268,6 +347,7 @@ async def wait_bypass_link(sent_id, chat_id=None):
     """
     chat = chat_id or GROUP_ID
     errors = []
+    tried_fw = set()
     t0 = time.time()
     cands = {}
     last_raw = []
@@ -292,6 +372,14 @@ async def wait_bypass_link(sent_id, chat_id=None):
             return r_replies[0], []
         if r_others:
             return r_others[0], []
+
+        # --- रास्ता 1b: message "unsupported" है -> control bot को forward करके Bot API से पढ़ो ---
+        for r in last_raw:
+            if r["unsupported"] and r["id"] not in tried_fw:
+                tried_fw.add(r["id"])
+                link = await link_via_botapi(chat, r["id"], errors)
+                if link:
+                    return link, []
 
         # --- रास्ता 2: Pyrogram से (live handler + history + ताज़ा fetch) ---
         ids = {i for i in group_inbox if i > sent_id} if chat == GROUP_ID else set()
@@ -552,6 +640,8 @@ async def bot_range(_, message):
 async def main():
     await userbot.start()
     await bot.start()
+    botinfo["username"] = (await bot.get_me()).username
+    asyncio.create_task(botapi_poller())
 
     # सारे chats/channels की जानकारी cache करो, वरना "Peer id invalid" आ सकता है
     async for _ in userbot.get_dialogs():
