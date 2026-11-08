@@ -35,7 +35,7 @@ BYPASS_TIMEOUT = 90         # group के bypass bot के जवाब का
 BYPASS_BOT = "Nick_Bypass_Bot"   # bypass bot का username (बिना @)
 BYPASS_VIA_DM = True         # True: पहले bot को सीधे DM में link भेजो, न चले तो group में
 SEND_FINAL_LINK_TO_GROUP = False   # True: आख़िरी link group में भी भेजो (record के लिए)
-MEDIA_QUIET_SECONDS = 30     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
+MEDIA_QUIET_SECONDS = 5     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
 MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
