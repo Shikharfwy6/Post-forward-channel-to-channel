@@ -34,9 +34,8 @@ FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक �
 BYPASS_TIMEOUT = 90         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
 BYPASS_BOT = "Nick_Bypass_Bot"   # bypass bot का username (बिना @)
 BYPASS_VIA_DM = True         # True: पहले bot को सीधे DM में link भेजो, न चले तो group में
-SEND_FINAL_LINK_TO_GROUP = False   # True: आख़िरी link group में भी भेजो (record के लिए)
 MEDIA_QUIET_SECONDS = 5     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
-MAX_HOPS = 6                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
+MAX_HOPS = 8                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
 userbot = Client(
@@ -59,6 +58,11 @@ bot = Client(
 running = {"active": False, "stop": False}
 own_sent_ids = set()   # script के अपने भेजे messages (video गिनती में न आएँ)
 state = {"got_video": False, "last_video": 0.0}
+progress = {"current": None, "last_done": None, "end": None}
+
+
+class CaptchaRequired(Exception):
+    """bypass bot ने captcha/verification माँगा, जो bot हल नहीं कर सकता"""
 
 
 # ---------- helpers ----------
@@ -206,10 +210,11 @@ def message_urls(m):
 
 
 def pick_next_link(urls):
-    """bot-link (?start=) या बाहरी link चुनो; t.me के channel/join links छोड़ दो"""
+    """पहले कोई bot-link (?start=) चुनो; न मिले तो पहला बाहरी link. t.me के channel/join links छोड़ो"""
     for u in urls:
         if parse_deep(u):
             return u
+    for u in urls:
         if "t.me/" not in u and "telegram.me/" not in u:
             return u
     return None
@@ -335,8 +340,10 @@ async def raw_group_messages(sent_id, chat_id=None):
             if u:
                 urls.append(u)
         mk = getattr(m, "reply_markup", None)
+        n_buttons = 0
         for row in (getattr(mk, "rows", None) or []):
             for btn in row.buttons:
+                n_buttons += 1
                 u = getattr(btn, "url", None)
                 if u:
                     urls.append(u)
@@ -347,6 +354,9 @@ async def raw_group_messages(sent_id, chat_id=None):
             "reply_to": getattr(rt, "reply_to_msg_id", None),
             "urls": urls,
             "unsupported": media == "MessageMediaUnsupported",
+            "photo": media == "MessageMediaPhoto",
+            "buttons": n_buttons,
+            "text": text,
             "summary": f"#{m.id} media={media} len={len(text)} '{text[:40]}'".replace("\n", " "),
         })
     return out
@@ -384,6 +394,16 @@ async def wait_bypass_link(sent_id, chat_id=None):
             return r_replies[0], []
         if r_others:
             return r_others[0], []
+
+        # --- captcha/verification की जाँच ---
+        for r in last_raw:
+            t = (r["text"] or "").lower()
+            looks_captcha = (
+                ("captcha" in t or "verify" in t or "verification" in t)
+                or (r["photo"] and (r["reply_to"] == sent_id or chat != GROUP_ID or r["buttons"] >= 4))
+            )
+            if looks_captcha:
+                raise CaptchaRequired()
 
         # --- रास्ता 1b: message "unsupported" है -> control bot को forward करके Bot API से पढ़ो ---
         for r in last_raw:
@@ -489,8 +509,37 @@ async def send_hidden(from_chat, msgs, dest):
             print("[hidden copy] fail:", type(e).__name__, str(e)[:80])
 
 
-async def pull_and_forward(username, payload):
-    """bot को /start भेजो; जो भी files (कितनी भी) आएँ उन्हें आते ही channel में भेजते जाओ"""
+async def forward_to_group(m):
+    """bot का message group में forward करो; न हो पाए तो text की copy भेजो"""
+    try:
+        await userbot.forward_messages(GROUP_ID, m.chat.id, m.id)
+    except Exception as e:
+        print("forward fail, text भेज रहा हूँ:", e)
+        txt = m.text.html if m.text else (m.caption.html if m.caption else "")
+        if txt:
+            await userbot.send_message(GROUP_ID, txt, disable_web_page_preview=True)
+
+
+# ---------- channel पर नज़र ----------
+@userbot.on_message(filters.chat(CHANNEL_ID))
+async def watch_channel(_, m):
+    if m.id in own_sent_ids:
+        return
+    is_video = bool(m.video) or bool(
+        m.document and m.document.mime_type and m.document.mime_type.startswith("video")
+    )
+    if is_video:
+        state["got_video"] = True
+        state["last_video"] = time.time()
+
+
+# ---------- मुख्य काम ----------
+async def visit_bot(username, payload):
+    """
+    bot को /start भेजो। जो भी media (कितना भी) आए उसे आते ही channel में भेजो
+    (sender और caption छिपाकर)। text/links जमा करो।
+    लौटाता है: (भेजी गई files की गिनती, bot के सारे messages)
+    """
     user = await userbot.get_users(username)
     collect["bot_id"] = user.id
     collect["msgs"] = []
@@ -498,60 +547,82 @@ async def pull_and_forward(username, payload):
 
     await userbot.send_message(username, f"/start {payload}")
 
-    done, total = set(), 0
+    done, total, msgs = set(), 0, []
     t0 = time.time()
     while True:
         await asyncio.sleep(2)
         if running["stop"]:
             break
-        new = [m for m in sorted(collect["msgs"], key=lambda x: x.id)
+        msgs = list(collect["msgs"])
+        new = [m for m in sorted(msgs, key=lambda x: x.id)
                if m.id not in done and is_media_msg(m)]
         if new:
             await send_hidden(user.id, new, CHANNEL_ID)
             done.update(m.id for m in new)
             total += len(new)
-        if collect["msgs"]:
-            if time.time() - collect["last"] >= MEDIA_QUIET_SECONDS:
+        if msgs:
+            # files आ रही हों तो ज़्यादा धैर्य, सिर्फ़ text हो तो जल्दी आगे
+            quiet = MEDIA_QUIET_SECONDS if total else BOT_QUIET_SECONDS
+            if time.time() - collect["last"] >= quiet:
                 break
         elif time.time() - t0 > FIRST_TIMEOUT:
             break
 
     collect["bot_id"] = None
-    return total
+    return total, msgs
 
 
-async def resolve_chain(start_link, notify, pid):
+async def run_chain(start_link, notify, pid):
     """
-    link -> (bot को /start) -> reply में नया link -> (बाहरी link हो तो group का bypass bot)
-    -> फिर bot... जब तक दूसरे bot का link न मिले। वही आख़िरी link है।
+    link से शुरू करो और जो भी bot/link मिले उसके पीछे चलते जाओ:
+      - bot-link  -> bot को /start; files आईं तो channel में भेजकर खत्म
+                     (सिर्फ़ text/link आया तो उस नए link पर आगे)
+      - बाहरी link -> bypass bot से bypass कराओ, फिर आगे
+    लौटाता है: channel में भेजी files की गिनती (0 = कुछ नहीं मिला)
     """
     current = start_link
-    last_bot = None
+    visited = set()
 
     for hop in range(MAX_HOPS):
         if running["stop"]:
-            return None
+            return 0
         deep = parse_deep(current)
 
         if deep:
             bot_user, payload = deep
-            if last_bot and bot_user.lower() != last_bot.lower():
-                return current                      # दूसरे bot का link = आख़िरी link
-            await notify(f"Post {pid}: @{bot_user} को /start भेज रहा हूँ…")
-            msgs = await fetch_from_bot(bot_user, payload)
+            key = (bot_user.lower(), payload)
+            if key in visited:
+                await notify(f"Post {pid}: वही link दोबारा आ गया (चक्कर), रुक गया")
+                return 0
+            visited.add(key)
+
+            await notify(f"Post {pid}: @{bot_user} पर जा रहा हूँ…")
+            total, msgs = await visit_bot(bot_user, payload)
+            if total:
+                return total
             if not msgs:
                 await notify(f"Post {pid}: @{bot_user} का कोई reply नहीं आया")
-                return None
-            last_bot = bot_user
+                return 0
+
             msgs = [await refresh(x) for x in msgs]
             urls = [u for x in msgs for u in message_urls(x)]
             nxt = pick_next_link(urls)
+
+            if not nxt:
+                # शायद message "unsupported" है: control bot को forward करके Bot API से पढ़ो
+                errors = []
+                for x in msgs:
+                    if not (x.text or x.caption) and not is_media_msg(x):
+                        nxt = await link_via_botapi(x.chat.id, x.id, errors)
+                        if nxt:
+                            break
             if not nxt:
                 for x in msgs:
                     await forward_to_group(x)
-                await notify(f"Post {pid}: reply में link नहीं मिला, message group में forward किया")
-                return None
+                await notify(f"Post {pid}: @{bot_user} के reply में file या link नहीं मिला, message group में forward किया")
+                return 0
             current = nxt
+
         else:
             # बाहरी (shortener) link: bypass bot से bypass कराओ (पहले DM, फिर group)
             bypassed, diag = None, []
@@ -571,70 +642,22 @@ async def resolve_chain(start_link, notify, pid):
                 extra = ("\nदेखा गया:\n" + "\n".join(diag)) if diag else "\n(कुछ नया नहीं दिखा)"
                 await notify(f"Post {pid}: {route} रास्ते से link नहीं मिला{extra}")
             if not bypassed:
-                return None
+                return 0
             current = bypassed
 
     await notify(f"Post {pid}: बहुत ज़्यादा कड़ियाँ हो गईं, रुक गया")
-    return None
+    return 0
 
 
-async def forward_to_group(m):
-    """bot का message group में forward करो; न हो पाए तो text की copy भेजो"""
-    try:
-        await userbot.forward_messages(GROUP_ID, m.chat.id, m.id)
-    except Exception as e:
-        print("forward fail, text भेज रहा हूँ:", e)
-        txt = m.text.html if m.text else (m.caption.html if m.caption else "")
-        if txt:
-            await userbot.send_message(GROUP_ID, txt, disable_web_page_preview=True)
-
-
-async def fetch_from_bot(username, payload):
-    """deep link पर क्लिक करने जैसा: bot को /start <payload> भेजो और उसके media जमा करो"""
-    user = await userbot.get_users(username)
-    collect["bot_id"] = user.id
-    collect["msgs"] = []
-    collect["last"] = 0.0
-
-    await userbot.send_message(username, f"/start {payload}")
-
-    t0 = time.time()
-    while True:
-        await asyncio.sleep(2)
-        if running["stop"]:
-            break
-        if collect["msgs"]:
-            if time.time() - collect["last"] >= BOT_QUIET_SECONDS:
-                break
-        elif time.time() - t0 > FIRST_TIMEOUT:
-            break
-
-    msgs = sorted(collect["msgs"], key=lambda x: x.id)
-    collect["bot_id"] = None
-    return msgs
-
-
-# ---------- channel पर नज़र ----------
-@userbot.on_message(filters.chat(CHANNEL_ID))
-async def watch_channel(_, m):
-    if m.id in own_sent_ids:
-        return
-    is_video = bool(m.video) or bool(
-        m.document and m.document.mime_type and m.document.mime_type.startswith("video")
-    )
-    if is_video:
-        state["got_video"] = True
-        state["last_video"] = time.time()
-
-
-# ---------- मुख्य काम ----------
 async def process_range(start_id, end_id, notify):
+    progress.update(current=None, last_done=None, end=end_id)
     await notify(f"शुरू: post {start_id} से {end_id} तक")
 
     for pid in range(start_id, end_id + 1):
         if running["stop"]:
             await notify("रोक दिया गया ⛔")
             return
+        progress["current"] = pid
         try:
             msg = await userbot.get_messages(SOURCE_CHANNEL_ID, pid)
             if not msg or msg.empty or msg.service:
@@ -655,27 +678,11 @@ async def process_range(start_id, end_id, notify):
             deep = re.search(r"t\.me/([A-Za-z0-9_]+)\?start=([\w-]+)", link)
 
             if AUTO_FETCH:
-                # link-चेन चलाओ: bot -> link -> bypass -> bot -> ... -> आख़िरी link
-                final_link = await resolve_chain(link, notify, pid)
-                if not final_link:
+                # link-चेन: जो भी bot/link मिले उसके पीछे चलो, files आते ही channel में
+                total = await run_chain(link, notify, pid)
+                if total == 0:
                     continue
-                if SEND_FINAL_LINK_TO_GROUP:
-                    await userbot.send_message(GROUP_ID, final_link)
-
-                final_deep = parse_deep(final_link)
-                if final_deep:
-                    # आख़िरी bot के पास जाओ, सारी files channel में (बिना sender/caption)
-                    await notify(f"Post {pid}: @{final_deep[0]} से files मँगा रहा हूँ…")
-                    total = await pull_and_forward(final_deep[0], final_deep[1])
-                    if total == 0:
-                        await notify(f"Post {pid}: bot से कोई file नहीं आई, अगले post पर जा रहा हूँ")
-                        continue
-                    await notify(f"Post {pid}: {total} files channel में भेजीं ✅")
-                else:
-                    # bot-link नहीं मिला: पुराना तरीका (आप हाथ से forward करो)
-                    await userbot.send_message(GROUP_ID, final_link)
-                    await notify(f"Post {pid}: link group में भेजा। अब videos channel में forward करो…")
-                    await wait_for_videos()
+                await notify(f"Post {pid}: {total} files channel में भेजीं ✅")
             else:
                 # पुराना तरीका: link group में भेजो, videos आप forward करोगे
                 await userbot.send_message(GROUP_ID, link)
@@ -684,11 +691,25 @@ async def process_range(start_id, end_id, notify):
 
             # 4) sticker भेजो, फिर अगला post
             await send_sticker()
+            progress["last_done"] = pid
+        except CaptchaRequired:
+            raise
         except Exception as e:
             print(f"Post {pid} में error:", e)
             await notify(f"Post {pid} error: {e}")
 
     await notify("सारे posts पूरे हो गए ✅")
+
+
+async def _exit_soon():
+    """clients बंद करके process खत्म करो (GitHub Actions का job भी यहीं ख़त्म हो जाएगा)"""
+    await asyncio.sleep(3)
+    for c in (bot, userbot):
+        try:
+            await asyncio.wait_for(c.stop(), timeout=10)
+        except Exception:
+            pass
+    os._exit(0)
 
 
 # ---------- control bot ----------
@@ -731,6 +752,16 @@ async def bot_range(_, message):
     async def job():
         try:
             await process_range(start_id, end_id, notify)
+        except CaptchaRequired:
+            cur, last, end = progress["current"], progress["last_done"], progress["end"]
+            await notify(
+                "⚠️ Nick Bypass Bot ने captcha (verification) माँगा है, जो मैं हल नहीं कर सकता। इसलिए रुक रहा हूँ।\n\n"
+                f"• captcha इस post पर आया: {cur}\n"
+                f"• आख़िरी पूरा हुआ post: {last if last else 'कोई नहीं'}\n\n"
+                f"पहले Nick Bypass Bot में captcha हल कर लीजिए, फिर bot चालू करके यह भेजिए:\n{cur} {end}\n\n"
+                f"(post {cur} की image channel में पहले ही जा चुकी हो सकती है, तो वह दोबारा आ सकती है)"
+            )
+            asyncio.create_task(_exit_soon())
         finally:
             running["active"] = False
 
