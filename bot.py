@@ -14,7 +14,7 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478              # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
@@ -164,13 +164,16 @@ def parse_deep(url):
 
 
 def message_urls(m):
-    """message के text, hyperlink और buttons से सारे URLs (क्रम में)"""
-    raw = ""
-    if m.text:
-        raw = m.text.html
-    elif m.caption:
-        raw = m.caption.html
-    urls = [u.rstrip(".,;)") for u in URL_RE.findall(htmllib.unescape(raw))]
+    """message के text, hyperlink (entities) और buttons से सारे URLs (क्रम में)"""
+    urls = []
+    txt = m.text or m.caption or ""
+    ents = (m.entities if m.text else m.caption_entities) or []
+    urls += [u.rstrip(".,;)") for u in URL_RE.findall(str(txt))]
+    for e in ents:
+        if getattr(e, "url", None):
+            urls.append(e.url)
+        elif getattr(e.type, "name", str(e.type)) == "URL":
+            urls.append(txt[e.offset:e.offset + e.length])
     kb = m.reply_markup
     if kb and hasattr(kb, "inline_keyboard"):
         for row in kb.inline_keyboard:
@@ -206,27 +209,66 @@ async def refresh(m):
     return m
 
 
+group_inbox = {}   # group में आए नए (दूसरों के) messages
+
+
+@userbot.on_message(filters.chat(GROUP_ID) & filters.incoming)
+@userbot.on_edited_message(filters.chat(GROUP_ID) & filters.incoming)
+async def group_watch(_, m):
+    group_inbox[m.id] = m
+    if len(group_inbox) > 100:
+        for k in sorted(group_inbox)[:-100]:
+            group_inbox.pop(k, None)
+
+
 async def wait_bypass_link(sent_id):
-    """group में हमारे भेजे link के बाद आए bypass bot के reply से t.me ?start= link निकालो"""
+    """
+    group में हमारे भेजे link के बाद आए bypass bot के reply से t.me ?start= link निकालो।
+    लौटाता है: (link या None, diagnostic list)
+    """
     t0 = time.time()
+    cands = {}
     while time.time() - t0 < BYPASS_TIMEOUT:
         await asyncio.sleep(3)
         if running["stop"]:
-            return None
+            return None, []
+
+        # 1) live handler से आए messages
+        cands = {i: m for i, m in group_inbox.items() if i > sent_id}
+
+        # 2) history से भी देखो (दोनों मिलाकर)
+        try:
+            async for m in userbot.get_chat_history(GROUP_ID, limit=15):
+                if m.id <= sent_id:
+                    break
+                if not m.outgoing:
+                    cands.setdefault(m.id, m)
+        except Exception as e:
+            print("[bypass] history error:", repr(e))
+
         replies, others = [], []
-        async for m in userbot.get_chat_history(GROUP_ID, limit=15):
-            if m.id <= sent_id:
-                break
-            if m.outgoing:
+        for i in sorted(cands, reverse=True):
+            m = cands[i]
+            try:
+                link = next((u for u in message_urls(m) if parse_deep(u)), None)
+            except Exception as e:
+                print("[bypass] parse error:", repr(e))
                 continue
-            link = next((u for u in message_urls(m) if parse_deep(u)), None)
             if link:
                 (replies if m.reply_to_message_id == sent_id else others).append(link)
         if replies:
-            return replies[0]
+            return replies[0], []
         if others:
-            return others[0]
-    return None
+            return others[0], []
+
+    diag = []
+    for i in sorted(cands)[:3]:
+        m = cands[i]
+        who = (m.from_user.first_name if m.from_user else "?")
+        snippet = str(m.text or m.caption or "[media]")[:60].replace("\n", " ")
+        diag.append(f"{who}: {snippet}")
+    print(f"[bypass] timeout, नए messages देखे: {len(cands)}")
+    return None, diag
 
 
 async def resolve_chain(start_link, notify, pid):
@@ -265,9 +307,10 @@ async def resolve_chain(start_link, notify, pid):
             # बाहरी (shortener) link: group के bypass bot से bypass कराओ
             sent = await userbot.send_message(GROUP_ID, current)
             await notify(f"Post {pid}: link group में भेजा, bypass का इंतज़ार…")
-            bypassed = await wait_bypass_link(sent.id)
+            bypassed, diag = await wait_bypass_link(sent.id)
             if not bypassed:
-                await notify(f"Post {pid}: bypass bot से link नहीं मिला")
+                extra = ("\nदेखे गए messages:\n" + "\n".join(diag)) if diag else "\n(group में कोई नया message नहीं दिखा)"
+                await notify(f"Post {pid}: bypass bot से link नहीं मिला{extra}")
                 return None
             current = bypassed
 
