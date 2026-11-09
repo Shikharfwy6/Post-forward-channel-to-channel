@@ -18,9 +18,10 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
-OWNER_ID = 8838634478                 # आपका user id (सिर्फ़ आप bot चला सकें)
+OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
 SOURCE_CHANNEL_ID = -1003298610413   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
+FAILED_CHANNEL_ID = -1004315192933     # bypass न हो पाए तो उस post की image + link यहाँ जाएँगे
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
 CHANNEL_ID = -1004435774367          # यहाँ image/video जाएगा, और इसी पर नज़र रहेगी
 STICKER_ID = "CAACAgUAAxkBAAICH2qksuIcm_ZAZV8pXDtSbcWP2QuoAAK6IQAC90IBVB6iwsOwbpqjPQQ"
@@ -71,9 +72,12 @@ class CaptchaRequired(SafeStop):
     reason = "Nick Bypass Bot ने captcha (verification) माँगा है, जो मैं हल नहीं कर सकता।"
 
 
-class BypassStuck(SafeStop):
-    """bypass bot से link नहीं मिला (न DM में, न group में)"""
-    reason = "Bypass bot से link नहीं मिल रहा (न DM में, न group में). शायद वह बंद है, बहुत धीमा है या कुछ और माँग रहा है।"
+class BypassStuck(Exception):
+    """bypass bot से link नहीं मिला (न DM में, न group में). रोकता नहीं, post failed channel में जाता है"""
+
+    def __init__(self, link=None):
+        super().__init__("bypass नहीं हुआ")
+        self.link = link
 
 
 # ---------- helpers ----------
@@ -682,11 +686,27 @@ async def run_chain(start_link, notify, pid):
             if not bypassed:
                 if running["stop"]:
                     return 0
-                raise BypassStuck()
+                raise BypassStuck(current)
             current = bypassed
 
     await notify(f"Post {pid}: बहुत ज़्यादा कड़ियाँ हो गईं, रुक गया")
     return 0
+
+
+async def report_failed(pid, msg, caption, stuck_link, first_link, notify):
+    """bypass न होने पर: post की image + link failed channel में भेजो"""
+    try:
+        await send_media(msg, caption, dest=FAILED_CHANNEL_ID)
+        text = f"Post {pid}\n\nअटका link:\n{stuck_link}"
+        if first_link and first_link != stuck_link:
+            text += f"\n\nशुरुआती link:\n{first_link}"
+        await userbot.send_message(
+            FAILED_CHANNEL_ID, text,
+            parse_mode=enums.ParseMode.DISABLED, disable_web_page_preview=True,
+        )
+        await notify(f"Post {pid}: bypass नहीं हुआ। image और link failed channel में भेज दिए, आगे बढ़ रहा हूँ")
+    except Exception as e:
+        await notify(f"Post {pid}: bypass नहीं हुआ और failed channel में भेजना भी fail हुआ ({type(e).__name__})")
 
 
 async def process_range(start_id, end_id, notify):
@@ -732,6 +752,9 @@ async def process_range(start_id, end_id, notify):
             # 4) sticker भेजो, फिर अगला post
             await send_sticker()
             progress["last_done"] = pid
+        except BypassStuck as e:
+            await report_failed(pid, msg, caption, e.link, link, notify)
+            continue
         except SafeStop:
             raise
         except Exception as e:
