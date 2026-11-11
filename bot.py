@@ -35,7 +35,8 @@ FIRST_TIMEOUT = 60           # bot से इतने सेकंड तक �
 BYPASS_TIMEOUT = 90         # group के bypass bot के जवाब का इंतज़ार (सेकंड)
 BYPASS_BOT = "Nick_Bypass_Bot"   # bypass bot का username (बिना @)
 BYPASS_VIA_DM = True         # True: पहले bot को सीधे DM में link भेजो, न चले तो group में
-MEDIA_QUIET_SECONDS = 7     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
+MEDIA_QUIET_SECONDS = 30     # आख़िरी file आने के इतने सेकंड बाद तक कुछ नया न आए तो पूरा माना जाएगा
+POST_DELAY_SECONDS = 8       # हर नए post से पहले का ठहराव (Telegram flood से बचने के लिए)
 MAX_HOPS = 8                 # एक post पर link-चेन की ज़्यादा से ज़्यादा कड़ियाँ
 # ============================================
 
@@ -45,6 +46,7 @@ userbot = Client(
     api_hash=API_HASH,
     session_string=STRING_SESSION,
     in_memory=True,
+    sleep_threshold=21600,   # FloodWait इतने सेकंड तक का हो तो खुद रुककर दोबारा कोशिश
     parse_mode=enums.ParseMode.HTML,
 )
 
@@ -54,6 +56,7 @@ bot = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     in_memory=True,
+    sleep_threshold=21600,   # FloodWait इतने सेकंड तक का हो तो खुद रुककर दोबारा कोशिश
 )
 
 running = {"active": False, "stop": False}
@@ -718,6 +721,8 @@ async def process_range(start_id, end_id, notify):
             await notify("रोक दिया गया ⛔")
             return
         progress["current"] = pid
+        if pid != start_id:
+            await asyncio.sleep(POST_DELAY_SECONDS)
         try:
             msg = await userbot.get_messages(SOURCE_CHANNEL_ID, pid)
             if not msg or msg.empty or msg.service:
@@ -752,6 +757,10 @@ async def process_range(start_id, end_id, notify):
             # 4) sticker भेजो, फिर अगला post
             await send_sticker()
             progress["last_done"] = pid
+        except FloodWait as fw:
+            stop = SafeStop()
+            stop.reason = f"Telegram ने बहुत लंबा flood wait ({fw.value} सेकंड) लगाया है।"
+            raise stop
         except BypassStuck as e:
             await report_failed(pid, msg, caption, e.link, link, notify)
             continue
