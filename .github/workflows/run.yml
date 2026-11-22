@@ -1,12 +1,21 @@
 name: Telegram Userbot
 
 on:
-  workflow_dispatch:        # सिर्फ़ हाथ से चलेगा
+  workflow_dispatch:
+    inputs:
+      fresh_start:
+        description: "पुराना सारा data/cache साफ़ करें"
+        type: boolean
+        default: true
 
-# एक ही session से दो instance एक साथ न चलें
+permissions:
+  contents: read
+  actions: write   # cache delete करने के लिए
+
+# पुराना run अपने आप cancel होकर नया चलेगा
 concurrency:
   group: telegram-userbot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -15,6 +24,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Clear old GitHub caches
+        if: ${{ inputs.fresh_start }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete --all --repo ${{ github.repository }} || true
+
+      - name: Clear old local data
+        if: ${{ inputs.fresh_start }}
+        run: |
+          find . -type f \( -name "*.session" -o -name "*.session-journal" \
+            -o -name "*.sqlite" -o -name "*.sqlite3" -o -name "*.db" \
+            -o -name "*.pickle" \) -delete
+          rm -rf data/ downloads/ temp/ __pycache__/ || true
 
       - name: Python setup
         uses: actions/setup-python@v5
