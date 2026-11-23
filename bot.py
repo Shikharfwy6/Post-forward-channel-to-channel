@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # बाकी सब code में
 OWNER_ID = 8838634478                # आपका user id (सिर्फ़ आप bot चला सकें)
-SOURCE_CHANNEL_ID = -1002195040944   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
+SOURCE_CHANNEL_ID = -1002221567777   # बड़ा channel (t.me/c/3298610413 -> -100 लगाकर)
 
 FAILED_CHANNEL_ID = -1004315192933     # bypass न हो पाए तो उस post की image + link यहाँ जाएँगे
 GROUP_ID = -1004385109465            # यहाँ Download/Watch link जाएगा
